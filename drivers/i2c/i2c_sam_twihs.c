@@ -63,11 +63,30 @@ struct twihs_msg {
 	uint8_t flags;
 };
 
+#ifdef CONFIG_I2C_TARGET
+/* Device run time data for I2C target mode */
+enum i2c_sam_twihs_target_state {
+	I2C_SAM_TWIHS_TARGET_IDLE,
+	I2C_SAM_TWIHS_TARGET_WRITE,
+	I2C_SAM_TWIHS_TARGET_READ,
+};
+
+struct i2c_sam_twihs_target_data {
+	struct i2c_target_config *config;
+	enum i2c_sam_twihs_target_state state;
+	bool read_in_progress;
+
+};
+#endif
+
 /* Device run time data */
 struct i2c_sam_twihs_dev_data {
 	struct k_sem lock;
 	struct k_sem sem;
 	struct twihs_msg msg;
+#ifdef CONFIG_I2C_TARGET
+	struct i2c_sam_twihs_target_data target;
+#endif
 };
 
 static int i2c_clk_set(Twihs *const twihs, uint32_t speed)
@@ -135,6 +154,14 @@ static int i2c_sam_twihs_configure(const struct device *dev, uint32_t config)
 	}
 
 	k_sem_take(&dev_data->lock, K_FOREVER);
+
+#ifdef CONFIG_I2C_TARGET
+	/* Do not reconfigure while target mode is registered. */
+	if (dev_data->target.config != NULL) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+#endif
 
 	/* Setup clock waveform */
 	ret = i2c_clk_set(twihs, bitrate);
@@ -234,11 +261,263 @@ unlock:
 	return ret;
 }
 
+#ifdef CONFIG_I2C_TARGET
+static __maybe_unused int i2c_sam_twihs_target_register(
+        const struct device *dev, struct i2c_target_config *cfg)
+{
+        const struct i2c_sam_twihs_dev_cfg *const dev_cfg = dev->config;
+        struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
+        Twihs *const twihs = dev_cfg->regs;
+        int ret = 0;
+
+        if (cfg == NULL || cfg->callbacks == NULL) {
+                return -EINVAL;
+        }
+
+        if (cfg->flags & I2C_TARGET_FLAGS_ADDR_10_BITS) {
+                return -ENOTSUP;
+        }
+
+        if (cfg->address > 0x7FU) {
+                return -EINVAL;
+        }
+
+        k_sem_take(&dev_data->lock, K_FOREVER);
+
+        if (dev_data->target.config != NULL) {
+                ret = -EBUSY;
+                goto unlock;
+        }
+
+        /* Disable controller interrupts and clear pending status. */
+        twihs->TWIHS_IDR = twihs->TWIHS_IMR;
+        (void)twihs->TWIHS_SR;
+
+        /* Configure the target address before entering target mode. */
+        twihs->TWIHS_SMR = TWIHS_SMR_SADR(cfg->address);
+
+        /* Disable controller mode before enabling target mode. */
+        twihs->TWIHS_CR = TWIHS_CR_MSDIS;
+
+        dev_data->target.state = I2C_SAM_TWIHS_TARGET_IDLE;
+        dev_data->target.read_in_progress = false;
+        dev_data->target.config = cfg;
+
+	/* Enable target mode. */
+	twihs->TWIHS_CR = TWIHS_CR_SVEN;
+
+	/* Enable target access, completion, and error interrupts. */
+	twihs->TWIHS_IER = TWIHS_IER_SVACC |
+					   TWIHS_IER_EOSACC |
+					   TWIHS_IER_OVRE |
+					   TWIHS_IER_UNRE |
+					   TWIHS_IER_ARBLST |
+					   TWIHS_IER_TOUT;
+
+unlock:
+        k_sem_give(&dev_data->lock);
+        return ret;
+}
+
+static __maybe_unused int i2c_sam_twihs_target_unregister(
+        const struct device *dev, struct i2c_target_config *cfg)
+{
+        const struct i2c_sam_twihs_dev_cfg *const dev_cfg = dev->config;
+        struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
+        Twihs *const twihs = dev_cfg->regs;
+        int ret = 0;
+
+        if (cfg == NULL) {
+                return -EINVAL;
+        }
+
+        k_sem_take(&dev_data->lock, K_FOREVER);
+
+        if (dev_data->target.config != cfg) {
+                ret = -EINVAL;
+                goto unlock;
+        }
+
+        /* Disable target interrupts and target mode. */
+        twihs->TWIHS_IDR = twihs->TWIHS_IMR;
+        (void)twihs->TWIHS_SR;
+        twihs->TWIHS_CR = TWIHS_CR_SVDIS;
+
+        dev_data->target.config = NULL;
+        dev_data->target.state = I2C_SAM_TWIHS_TARGET_IDLE;
+        dev_data->target.read_in_progress = false;
+
+        /* Restore the driver's default controller mode. */
+        twihs->TWIHS_CR = TWIHS_CR_MSEN;
+
+unlock:
+        k_sem_give(&dev_data->lock);
+        return ret;
+}
+#endif /* CONFIG_I2C_TARGET */
+
+#ifdef CONFIG_I2C_TARGET
+static void i2c_sam_twihs_target_isr(const struct device *dev);
+#endif
+
+/* NEW: Target ISR implementation */ //11/6/2026 -JM
+#ifdef CONFIG_I2C_TARGET
+static void i2c_sam_twihs_target_isr(const struct device *dev)
+{
+        const struct i2c_sam_twihs_dev_cfg *const dev_cfg = dev->config;
+        struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
+        struct i2c_sam_twihs_target_data *const target = &dev_data->target;
+        Twihs *const twihs = dev_cfg->regs;
+        struct i2c_target_config *cfg = target->config;
+        const struct i2c_target_callbacks *callbacks;
+        uint32_t status;
+        uint32_t pending;
+        uint8_t value = 0;
+        int ret;
+
+        if (cfg == NULL) {
+                return;
+        }
+
+        callbacks = cfg->callbacks;
+
+        /* Read status once: several hardware flags clear on read. */
+        status = twihs->TWIHS_SR;
+        pending = status & twihs->TWIHS_IMR;
+
+        /* Report hardware transfer errors. */
+        if (pending & (TWIHS_SR_OVRE | TWIHS_SR_UNRE |
+                       TWIHS_SR_ARBLST | TWIHS_SR_TOUT)) {
+                if (callbacks->error != NULL) {
+                        enum i2c_error_reason reason = I2C_ERROR_GENERIC;
+
+                        if (pending & TWIHS_SR_ARBLST) {
+                                reason = I2C_ERROR_ARBITRATION;
+                        } else if (pending & TWIHS_SR_TOUT) {
+                                reason = I2C_ERROR_TIMEOUT;
+                        }
+
+                        callbacks->error(cfg, reason);
+                }
+        }
+
+        /* An access has ended, possibly because of repeated START. */
+        if (pending & TWIHS_SR_EOSACC) {
+                twihs->TWIHS_IDR = TWIHS_IDR_RXRDY |
+                                   TWIHS_IDR_TXRDY |
+                                   TWIHS_IDR_NACK;
+
+                target->state = I2C_SAM_TWIHS_TARGET_IDLE;
+                target->read_in_progress = false;
+
+                /*
+                 * EOSACC alone does not distinguish STOP from
+                 * repeated START. Do not invoke stop() here yet.
+                 */
+                twihs->TWIHS_IER = TWIHS_IER_SVACC;
+        }
+
+        /* New target access. */
+        if ((status & TWIHS_SR_SVACC) &&
+            target->state == I2C_SAM_TWIHS_TARGET_IDLE) {
+
+                twihs->TWIHS_IDR = TWIHS_IDR_SVACC;
+
+                if (status & TWIHS_SR_SVREAD) {
+                        target->state = I2C_SAM_TWIHS_TARGET_READ;
+                        target->read_in_progress = false;
+                        twihs->TWIHS_IER = TWIHS_IER_TXRDY |
+                                           TWIHS_IER_NACK;
+                } else {
+                        target->state = I2C_SAM_TWIHS_TARGET_WRITE;
+
+                        if (callbacks->write_requested != NULL) {
+                                ret = callbacks->write_requested(cfg);
+                                if (ret < 0) {
+                                        /*
+                                         * Rejection requires hardware
+                                         * NACK timing validation.
+                                         */
+                                        if (callbacks->error != NULL) {
+                                                callbacks->error(
+                                                        cfg, I2C_ERROR_GENERIC);
+                                        }
+                                }
+                        }
+
+                        twihs->TWIHS_IER = TWIHS_IER_RXRDY;
+                }
+        }
+
+        /* Process a received data byte. */
+        if ((status & TWIHS_SR_RXRDY) &&
+            target->state == I2C_SAM_TWIHS_TARGET_WRITE) {
+
+                value = (uint8_t)twihs->TWIHS_RHR;
+
+                if (callbacks->write_received != NULL) {
+                        ret = callbacks->write_received(cfg, value);
+
+                        if (ret < 0 && callbacks->error != NULL) {
+                                callbacks->error(cfg, I2C_ERROR_GENERIC);
+                        }
+                }
+        }
+
+        /* Supply transmit data to the controller. */
+        if (target->state == I2C_SAM_TWIHS_TARGET_READ) {
+
+                if (pending & TWIHS_SR_NACK) {
+                        twihs->TWIHS_IDR = TWIHS_IDR_TXRDY;
+                } else if ((status & TWIHS_SR_TXRDY) &&
+                           (twihs->TWIHS_IMR & TWIHS_IER_TXRDY)) {
+
+                        ret = -ENOTSUP;
+
+                        if (!target->read_in_progress) {
+                                if (callbacks->read_requested != NULL) {
+                                        ret = callbacks->read_requested(
+                                                cfg, &value);
+                                }
+                        } else if (callbacks->read_processed != NULL) {
+                                ret = callbacks->read_processed(
+                                        cfg, &value);
+                        }
+
+                        if (ret == 0) {
+                                twihs->TWIHS_THR = value;
+                                target->read_in_progress = true;
+                        } else {
+                                /*
+                                 * No byte available. Stop requesting TXRDY
+                                 * interrupts. Hardware recovery behavior
+                                 * must be verified before production use.
+                                 */
+                                twihs->TWIHS_IDR = TWIHS_IDR_TXRDY;
+
+                                if (callbacks->error != NULL) {
+                                        callbacks->error(
+                                                cfg, I2C_ERROR_GENERIC);
+                                }
+                        }
+                }
+        }
+}
+#endif /* CONFIG_I2C_TARGET */
+
 static void i2c_sam_twihs_isr(const struct device *dev)
 {
 	const struct i2c_sam_twihs_dev_cfg *const dev_cfg = dev->config;
 	struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
 	Twihs *const twihs = dev_cfg->regs;
+
+#ifdef CONFIG_I2C_TARGET
+	if (dev_data->target.config != NULL) {
+		i2c_sam_twihs_target_isr(dev);
+		return;
+	}
+#endif
+
 	struct twihs_msg *msg = &dev_data->msg;
 	uint32_t isr_status;
 
@@ -340,6 +619,10 @@ static int i2c_sam_twihs_initialize(const struct device *dev)
 static DEVICE_API(i2c, i2c_sam_twihs_driver_api) = {
 	.configure = i2c_sam_twihs_configure,
 	.transfer = i2c_sam_twihs_transfer,
+#ifdef CONFIG_I2C_TARGET
+	.target_register = i2c_sam_twihs_target_register,
+	.target_unregister = i2c_sam_twihs_target_unregister,
+#endif
 };
 
 #define I2C_TWIHS_SAM_INIT(n)						\
